@@ -15,25 +15,41 @@ type QueueMiddleware struct {
 	isConsuming bool
 }
 
-func (qm *QueueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	msgs, err := qm.channel.Consume(
-		qm.queue.Name,
-		qm.queue.Name,
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-
+func NewQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
+	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%d", connectionSettings.Hostname, connectionSettings.Port))
 	if err != nil {
-		if qm.isDisconnectedErr(err) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return nil, err
 	}
 
+	channel, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	queue, err := queueDeclare(queueName, channel)
+	if err != nil {
+		_ = channel.Close()
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return &QueueMiddleware{
+		conn:    conn,
+		channel: channel,
+		queue:   queue,
+	}, nil
+}
+
+func (qm *QueueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
+	msgs, err := qm.consume()
+	if err != nil {
+		return err
+	}
+
+	defer func() { qm.isConsuming = false }()
 	qm.isConsuming = true
+
 	for d := range msgs {
 		msg := m.Message{Body: string(d.Body)}
 		ack := func() { _ = d.Ack(false) }
@@ -41,7 +57,6 @@ func (qm *QueueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack f
 
 		callbackFunc(msg, ack, nack)
 	}
-	qm.isConsuming = false
 
 	if qm.conn.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
@@ -107,20 +122,21 @@ func (qm *QueueMiddleware) isDisconnectedErr(err error) bool {
 	return qm.conn.IsClosed() || errors.Is(err, amqp.ErrClosed)
 }
 
-func NewQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
-	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%d", connectionSettings.Hostname, connectionSettings.Port))
-	if err != nil {
-		return nil, err
-	}
+func queueDeclare(name string, channel *amqp.Channel) (amqp.Queue, error) {
+	return channel.QueueDeclare(
+		name,
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+}
 
-	channel, err := conn.Channel()
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
-	queue, err := channel.QueueDeclare(
-		queueName,
+func (qm *QueueMiddleware) consume() (<-chan amqp.Delivery, error) {
+	msgs, err := qm.channel.Consume(
+		qm.queue.Name,
+		qm.queue.Name,
 		false,
 		false,
 		false,
@@ -128,14 +144,11 @@ func NewQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.
 		nil,
 	)
 	if err != nil {
-		_ = channel.Close()
-		_ = conn.Close()
-		return nil, err
+		if qm.isDisconnectedErr(err) {
+			return nil, m.ErrMessageMiddlewareDisconnected
+		}
+		return nil, m.ErrMessageMiddlewareMessage
 	}
 
-	return &QueueMiddleware{
-		conn:    conn,
-		channel: channel,
-		queue:   queue,
-	}, nil
+	return msgs, nil
 }

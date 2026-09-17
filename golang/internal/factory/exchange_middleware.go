@@ -11,54 +11,69 @@ import (
 type ExchangeMiddleware struct {
 	conn        *amqp.Connection
 	channel     *amqp.Channel
+	queue       *amqp.Queue
 	exchange    string
 	topics      []string
 	isConsuming bool
 }
 
+func NewExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
+	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%d", connectionSettings.Hostname, connectionSettings.Port))
+	if err != nil {
+		return nil, err
+	}
+
+	channel, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	if err := channel.Qos(1, 0, false); err != nil {
+		_ = conn.Close()
+		_ = channel.Close()
+		return nil, err
+	}
+
+	err = exchangeDeclare(exchange, channel)
+	if err != nil {
+		_ = conn.Close()
+		_ = channel.Close()
+		return nil, err
+	}
+
+	queue, err := anonymousQueueDeclare(channel)
+	if err != nil {
+		_ = conn.Close()
+		_ = channel.Close()
+		return nil, err
+	}
+
+	err = bindQueueToTopics(&queue, channel, exchange, keys)
+	if err != nil {
+		_ = conn.Close()
+		_ = channel.Close()
+		return nil, err
+	}
+
+	return &ExchangeMiddleware{
+		conn:     conn,
+		channel:  channel,
+		queue:    &queue,
+		exchange: exchange,
+		topics:   keys,
+	}, nil
+}
+
 func (em *ExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	queue, err := em.channel.QueueDeclare(
-		"",
-		false,
-		false,
-		true,
-		false,
-		nil,
-	)
+	msgs, err := em.consume()
 	if err != nil {
-		return m.ErrMessageMiddlewareMessage
+		return err
 	}
 
-	for _, topic := range em.topics {
-		err = em.channel.QueueBind(
-			queue.Name,
-			topic,
-			em.exchange,
-			false,
-			nil,
-		)
-		if err != nil {
-			return m.ErrMessageMiddlewareMessage
-		}
-	}
-
-	msgs, err := em.channel.Consume(
-		queue.Name,
-		em.consumerTag(),
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		if em.isDisconnectedErr(err) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
-	}
-
+	defer func() { em.isConsuming = false }()
 	em.isConsuming = true
+
 	for d := range msgs {
 		msg := m.Message{Body: string(d.Body)}
 		ack := func() { _ = d.Ack(false) }
@@ -66,7 +81,6 @@ func (em *ExchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ac
 
 		callbackFunc(msg, ack, nack)
 	}
-	em.isConsuming = false
 
 	if em.conn.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
@@ -92,23 +106,11 @@ func (em *ExchangeMiddleware) StopConsuming() error {
 
 func (em *ExchangeMiddleware) Send(msg m.Message) error {
 	for _, topic := range em.topics {
-		err := em.channel.Publish(
-			em.exchange,
-			topic,
-			false,
-			false,
-			amqp.Publishing{
-				Body: []byte(msg.Body),
-			},
-		)
+		err := em.publish(msg, topic)
 		if err != nil {
-			if em.isDisconnectedErr(err) {
-				return m.ErrMessageMiddlewareDisconnected
-			}
-			return m.ErrMessageMiddlewareMessage
+			return err
 		}
 	}
-
 	return nil
 }
 
@@ -137,21 +139,60 @@ func (em *ExchangeMiddleware) consumerTag() string {
 	return em.exchange
 }
 
-func NewExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
-	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%d", connectionSettings.Hostname, connectionSettings.Port))
+func bindQueueToTopics(queue *amqp.Queue, channel *amqp.Channel, exchange string, topics []string) error {
+	for _, topic := range topics {
+		if channel.QueueBind(
+			queue.Name,
+			topic,
+			exchange,
+			false,
+			nil,
+		) != nil {
+			return m.ErrMessageMiddlewareMessage
+		}
+	}
+	return nil
+}
+
+func anonymousQueueDeclare(channel *amqp.Channel) (amqp.Queue, error) {
+	queue, err := channel.QueueDeclare(
+		"",
+		false,
+		false,
+		true,
+		false,
+		nil,
+	)
 	if err != nil {
-		return nil, err
+		return amqp.Queue{}, m.ErrMessageMiddlewareMessage
 	}
 
-	channel, err := conn.Channel()
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
+	return queue, nil
+}
 
-	err = channel.ExchangeDeclare(
-		exchange,
-		"topic",
+func (em *ExchangeMiddleware) publish(msg m.Message, topic string) error {
+	err := em.channel.Publish(
+		em.exchange,
+		topic,
+		false,
+		false,
+		amqp.Publishing{
+			Body: []byte(msg.Body),
+		},
+	)
+	if err != nil {
+		if em.isDisconnectedErr(err) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+	return nil
+}
+
+func (em *ExchangeMiddleware) consume() (<-chan amqp.Delivery, error) {
+	msgs, err := em.channel.Consume(
+		em.queue.Name,
+		em.consumerTag(),
 		false,
 		false,
 		false,
@@ -159,15 +200,22 @@ func NewExchangeMiddleware(exchange string, keys []string, connectionSettings m.
 		nil,
 	)
 	if err != nil {
-		_ = conn.Close()
-		_ = channel.Close()
-		return nil, err
+		if em.isDisconnectedErr(err) {
+			return nil, m.ErrMessageMiddlewareDisconnected
+		}
+		return nil, m.ErrMessageMiddlewareMessage
 	}
+	return msgs, nil
+}
 
-	return &ExchangeMiddleware{
-		conn:     conn,
-		channel:  channel,
-		exchange: exchange,
-		topics:   keys,
-	}, nil
+func exchangeDeclare(exchange string, channel *amqp.Channel) error {
+	return channel.ExchangeDeclare(
+		exchange,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
 }
